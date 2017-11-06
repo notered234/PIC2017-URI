@@ -1,0 +1,688 @@
+/*********************************************************************************************/
+/* BME 361 Biomeasurement Lab - PIC18F4525BT Demo                          		       		 */
+/* Laboratories 1-8: A/D, D/A, LCD display, ECG simulation, filters, QRS detection		 	 */
+/* Instructors: John DiCecco, Ying Sun         						                         */
+/* Update history: 12/01/2015 modified by Cody Goldberg for Bluetooth interface				 */
+/*                 03/12/2016 modified by Ying Sun for supporting both LCD and BT			 */
+/*                 03/24/2016 modified by Ying Sun for XC8 compiler                          */
+/*********************************************************************************************/
+
+/**************************** Specify the chip that we are using *****************************/
+#include <p18cxxx.h>
+#include <math.h>
+#include <stdlib.h>
+
+/************************* Configure the Microcontroller PIC18f4525 **************************/
+#pragma config OSC = XT
+#pragma config WDT = OFF
+#pragma config PWRT = OFF
+#pragma config FCMEN = OFF
+#pragma config IESO = OFF
+#pragma config BOREN = ON
+#pragma config BORV = 2
+#pragma config WDTPS = 128
+#pragma config PBADEN = OFF
+#pragma config DEBUG = OFF
+#pragma config LVP = OFF
+#pragma config STVREN = OFF
+#define _XTAL_FREQ 4000000
+
+/******************************** Define Prototype Functions *********************************/
+unsigned char ReadADC();
+void Delay_ms(unsigned int x);
+void Transmit(unsigned char value);
+void TransmitBT(unsigned char value);
+void PrintNum(unsigned char value1, unsigned char position1);
+void SetupBluetooth();
+void SetupSerial();
+void SetupADC(unsigned char channel);
+void ClearScreen();
+void Backlight(unsigned char state);
+void SetPosition(unsigned char position);
+void PrintLine(const unsigned char *string, unsigned char numChars);
+void PrintInt(int value, unsigned char position);
+void interrupt isr(void);
+
+/************************************** Global variables *************************************/
+unsigned char function, functionBT, mode, update, debounce0, debounce1, debounce2;
+unsigned char LEDcount, output, output1, output2, counter, counter1, skipCount;
+unsigned char data0, data1, data2, array[9], rank[9], do_MOBD, refractory, display;
+unsigned char temp, sampling[16], TMRcntH[16], TMRcntL[16], sampling_H, sampling_L;
+unsigned char enableBT; // BLUETOOTH
+int i, j, dummy, d0, d1, d2, mobd, threshold, rri_count, hr;
+
+unsigned char ReadADC() { /************* start A/D, read from an A/D channel *****************/
+    unsigned char ADC_VALUE;
+    ADCON0bits.GO = 1;				// Start the AD conversion
+    while(!PIR1bits.ADIF) continue;	// Wait until AD conversion is complete
+    ADC_VALUE = ADRESH;				// Return the highest 8 bits of the 10-bit AD conversion
+    return ADC_VALUE;
+}
+
+void Delay_ms(unsigned int x){ 	/****** Generate a delay for x ms, assuming 4 MHz clock ******/
+    unsigned char y;
+    for(;x > 0; x--) for(y=0; y< 82;y++);
+}
+
+void Transmit(unsigned char value) {  /********** send an ASCII Character to USART ***********/
+    while(!PIR1bits.TXIF) continue;		// Wait until USART is ready
+    TXREG = value;						// Send the data
+    while (!PIR1bits.TXIF) continue;	// Wait until USART is ready
+    Delay_ms(4); // Give the LCD some time to listen to what we've got to say.
+}
+
+void TransmitBT(unsigned char value) {  /********* send an ASCII Character to USART **********/
+    while(!PIR1bits.TXIF) continue;		// Wait until USART is ready
+    TXREG = value;						// Send the data
+    while (!PIR1bits.TXIF) continue;	// Wait until USART is ready
+}
+
+void PrintNum(unsigned char value1, unsigned char position1){ /** Print number at position ***/
+    int units, tens, hundreds, thousands;
+    SetPosition(position1);			// Set at the present position
+    hundreds = value1 / 100;		// Get the hundreds digit, convert to ASCII and send
+    if (hundreds != 0) Transmit(hundreds + 48);
+    else Transmit(20);
+    value1 = value1 - hundreds * 100;
+    tens = value1 / 10;				// Get the tens digit, convert to ASCII and send
+    Transmit(tens + 48);
+    units = value1 - tens * 10;
+    Transmit(units + 48);			// Convert to ASCII and send
+}
+
+void SetupBluetooth() { /*************** set up Bluetooth modem Roving RN-42 *****************/
+    SPBRG = 1;          // Push up to 115200 BAUD to configure the BL module.
+    Delay_ms(500);
+//    TransmitBT("$");      // Enter command mode
+//    TransmitBT("$");
+//    TransmitBT("$");
+//    Delay_ms(100);      // Wait for the BL module to respond
+//    PrintLine((const unsigned char*)"U,115200,N", 8);   // Tell it that we want 9600 BAUD
+//    Delay_ms(100);
+}
+
+
+void SetupSerial(){  /*********** Set up the USART Asynchronous Transmit (pin 25) ************/
+// For LCD - use SPBRG = 25;  9600 BAUD at 4MHz: 4,000,000/(16x9600) - 1 = 25.04
+// For Bluetooth - use SPBRG = 1; 115200 BAUD at 4MHz: 4,000,000/(16x115200) - 1 = 1
+    TRISC = 0x80;					// Transmit and receive, 0xC0 if transmit only
+    SPBRG = 25;
+    TXSTAbits.TXEN = 1;				// Transmit enable
+    TXSTAbits.SYNC = 0;				// Asynchronous mode
+    RCSTAbits.CREN = 1;				// Continuous receive (receiver enabled)
+    RCSTAbits.SPEN = 1;				// Serial Port Enable
+    TXSTAbits.BRGH = 1;				// High speed baud rate
+}
+
+void SetupADC(unsigned char channel){ 	/******** Configure A/D and Set the Channel **********/
+    ADCON0 = (channel << 2) + 0b00000001;   // its 5-2 = channel; bit 1: GO; bit 0: Power On
+    PIE1bits.ADIE = 0;		// Turn off the AD interrupt
+    PIR1bits.ADIF = 0;		// Reset the AD interrupt flag
+}
+
+void ClearScreen(){   /************************** Clear LCD Screen ***************************/
+    Transmit(254);					// See datasheets for Serial LCD and HD44780
+    Transmit(0x01);					// Available on our course webpage
+}
+
+void Backlight(unsigned char state){  /************* Turn LCD Backlight on/off ***************/
+    Transmit(124);
+    if (state) Transmit(0x9D);		// If state == 1, backlight on; ox96 for 73% on
+    else Transmit(0x81);			// otherwise, backlight off
+}
+
+void SetPosition(unsigned char position){ 	/********** Set LCD Cursor Position  *************/
+    Transmit(254);
+    Transmit(128 + position);
+}
+
+void PrintLine(const unsigned char *string, unsigned char numChars){ /**** Print characters ****/
+    unsigned char count;
+    for (count=0; count<numChars; count++) Transmit(string[count]);
+}
+
+void PrintInt(int value, unsigned char position){ /******** Print number at position *********/
+    int units, tens, hundreds, thousands;
+    SetPosition(position);				// Set at the present position
+    if (value > 9999) {
+        PrintLine((const unsigned char*)"Over", 4);
+        return;
+    }
+    if (value < -9999) {
+        PrintLine((const unsigned char*)"Under", 5);
+        return;
+    }
+    if (value < 0) {
+        value = -value;
+        Transmit(45);
+    }
+    else Transmit(43);
+    thousands = value / 1000;		// Get the thousands digit, convert to ASCII and send
+    if (thousands != 0) Transmit(thousands + 48);
+    value = value - thousands * 1000;
+    hundreds = value / 100;			// Get the hundreds digit, convert to ASCII and send
+    Transmit(hundreds + 48);
+    value = value - hundreds * 100;
+    tens = value / 10;				// Get the tens digit, convert to ASCII and send
+    Transmit(tens + 48);
+    units = value - tens * 10;
+    Transmit(units + 48);			// Convert to ASCII and send
+}
+
+void interrupt isr(void) { /************ high priority interrupt service routine *************/
+    if (INTCONbits.TMR0IF == 1) {	// When there is a timer0 overflow, this loop runs
+        INTCONbits.TMR0IE = 0;		// Disable TMR0 interrupt
+        INTCONbits.TMR0IF = 0;		// Reset timer 0 interrupt flag to 0
+        switch (function) {
+        case 0:
+            TMR0H = 0xEF;       // Reload TMR0 for 4.167 ms count, Sampling rate = 240 Hz
+            TMR0L = 0xEA;       // 0xFFFF-0xEFB8 = 0x1047 = 4167, adjust for delay by 50 us
+            break;
+        case 1:					// Function 1: ECG simulation
+            TMR0H = 0xFC;		// Reload TMR0 for 1 ms count, sampling rate = 1KHz
+            TMR0L = 0x4D;		// 0xFFFF-0xFC17 = 0x3E8 = 1000,adust for delay by 54 us
+            switch (mode) {
+                case 0:										// P wave up
+                    counter++;		output++;		if (counter == 30) mode++;
+                    break;
+                case 1:										// P wave flat
+                    counter--;		if (counter == 0) mode++;
+                    break;
+                case 2:										// P wave down
+                    counter++;		output--;		if (counter == 30) mode++;
+                    break;
+                case 3:										// PR segment
+                    counter++;		if (counter == 100) mode++;
+                    break;
+                case 4:										// QRS complex - Q
+                    counter++;		output -= 3;
+                    if (counter == 105){
+                        counter = 0;
+                        mode++;
+                    }
+                    break;
+                case 5:										// QRS complex - R up
+                    counter++;		output += 6;	if (counter == 30) mode++;
+                    break;
+                case 6:										// QRS complex - R down
+                    counter++;		output -= 6;	if (counter == 62) mode++;
+                    break;
+                case 7:										//QRS complex - S
+                    counter++;		output += 3;
+                    if (counter == 71) {
+                        mode++;
+                        counter = 0;
+                    }
+                    break;
+                case 8:										// ST segment
+                    counter++;
+                    if (counter == 89){
+                        counter = 0;
+                        mode++;
+                    }
+                    break;
+                case 9:										// T wave up
+                    counter++;		output++;		if (counter == 55)mode++;
+                    break;
+                case 10:									// T wave flat
+                    counter++;		if (counter == 110) mode++;
+                    break;
+                case 11:									// T wave down
+                    counter++;		output--;		if (counter == 165) mode++;
+                    break;
+                case 12:									// End ECG
+                    counter--;		if (counter == 0) mode++;
+                    break;
+                case 13:									// Reset ECG
+                    counter++;
+                    if (counter == 202){
+                        counter = mode = 0;
+                        output = 50;
+                    }
+                    break;
+            }
+            PORTD = output;
+            if (enableBT) {
+                skipCount++;
+                if (skipCount == 8) {
+                    TransmitBT(functionBT);
+                    TransmitBT(output);
+                    TransmitBT(128);
+                    skipCount = 0;
+                }
+            }
+            break;
+        case 2:						// Function 2: Echo
+            TMR0H = 0xEF;           // Reload TMR0 for 4.167 ms count, Sampling rate = 240 Hz
+            TMR0L = 0xEF;           // 0xFFFF-0xEFB8 = 0x1047 = 4167, adjust for delay by 55 us
+            data0 = ReadADC();		// Read A/D and save the present sample in data0
+            output = data0;
+            PORTD = output;			// Echo back
+            if (enableBT) {
+                skipCount++;
+                if (skipCount == 2) {
+                    TransmitBT(functionBT);
+                    TransmitBT(data0);
+                    TransmitBT(output);
+                    skipCount = 0;
+                }
+            }
+            break;
+        case 3:						// Function 3: Echo (vary rate)
+            TMR0H = sampling_H;		// Reload TMR0 high-order byte
+            TMR0L = sampling_L;		// Reload TMR0 low-order byte
+            SetupADC(2);					// Switch to A/D channel AN2
+            counter = ReadADC();			// Read potentiometer setting from AN2
+            SetupADC(0);					// Switch to A/D channel AN0
+            counter = counter >> 4;			// Scale it to 0-15
+            sampling_L = TMRcntL[counter];	// Load TMR0 low-order byte
+            sampling_H = TMRcntH[counter];	// Load TMR0 high-order byte
+            data0 = ReadADC();		// Read A/D and save the present sample in data0
+            output = data0;
+            PORTD = data0;			// Echo back
+            if (enableBT) {
+                skipCount++;
+                if (skipCount == 2) {
+                    TransmitBT(functionBT);
+                    TransmitBT(data0);
+                    TransmitBT(output);
+                    skipCount = 0;
+                }
+            }
+            break;
+        case 4:						// Function 4: Derivative
+            TMR0H = 0xEF;           // Reload TMR0 for 4.167 ms count, Sampling rate = 240 Hz
+            TMR0L = 0xF6;           // 0xFFFF-0xEFB8 = 0x1047 = 4167, adjust for delay by 62 us
+            data1 = data0;			// Store previous data points
+            data0 = ReadADC();		// Read A/D and save the present sample in data0
+            dummy = (int)data0 - data1 + 128;	// Take derivative & shift to middle
+            if (dummy < 0) dummy = 0;       // Chop off if outside the range of 0 - 255
+            if (dummy > 255) dummy = 255;   
+            output2 = output1;
+            output1 = output;
+            output = (unsigned char)dummy;                    
+            PORTD = output;
+            if (enableBT) {
+                d2 = d1;
+                d1 = d0;
+                d0 = (int)data0 - data1;
+                if (d0 < 0) d0 = -d0;
+                skipCount++;
+                if (skipCount == 2) {
+                    if (d2 > 40) output = output2;
+                    if (d1 > 40) output = output1;
+                    TransmitBT(functionBT);
+                    TransmitBT(data0);
+                    TransmitBT(output);
+                    skipCount = 0;
+                }
+            }
+            break;
+        case 5:						// Function 5: Low-pass filter
+            TMR0H = 0xEF;           // Reload TMR0 for 4.167 ms count, Sampling rate = 240 Hz
+            TMR0L = 0xF6;           // 0xFFFF-0xEFB8 = 0x1047 = 4167, adjust for delay by 62 us
+            data2 = data1;			// Store previous data points
+            data1 = data0;
+            data0 = ReadADC();		// Read A/D and save the present sample in data0
+            dummy = ((int)data0 + data1 + data1 + data2) / 4;	// smoother
+            output = (unsigned char)dummy;
+            PORTD = output;         // Output to D/A
+            if (enableBT) {
+                skipCount++;
+                if (skipCount == 2) {
+                    TransmitBT(functionBT);
+                    TransmitBT(data0);
+                    TransmitBT(output);
+                    skipCount = 0;
+                }
+            }
+            break;
+        case 6:						// Function 6: High-frequency enhancement filter
+            TMR0H = 0xEF;           // Reload TMR0 for 4.167 ms count, Sampling rate = 240 Hz
+            TMR0L = 0xF6;           // 0xFFFF-0xEFB8 = 0x1047 = 4167, adjust for delay by 62 us
+            data2 = data1;			// Store previous data points
+            data1 = data0;
+            data0 = ReadADC();		// Read A/D and save the present sample in data0
+            dummy = ((int)data0 + data1 + data1 + data2) / 4;	// smoother
+            dummy = data0 + data0 - dummy;               
+            if (dummy < 0) dummy = 0;       // Chop off if outside the range of 0 - 255
+            if (dummy > 255) dummy = 255;   
+            output2 = output1;
+            output1 = output;
+            output = (unsigned char)dummy;                    
+            PORTD = output;
+            if (enableBT) {
+                d2 = d1;
+                d1 = d0;
+                d0 = ((int)data0 + data1 + data1 + data2) / 4;
+                d0 = data0 - d0;
+                if (d0 < 0) d0 = -d0;
+                skipCount++;
+                if (skipCount == 2) {
+                    if (d2 > 40) output = output2;
+                    if (d1 > 40) output = output1;
+                    TransmitBT(functionBT);
+                    TransmitBT(data0);
+                    TransmitBT(output);
+                    skipCount = 0;
+                }
+            }
+            break;
+        case 7:						// Function 7: 60Hz notch filter
+            TMR0H = 0xEF;           // Reload TMR0 for 4.167 ms count, Sampling rate = 240 Hz
+            TMR0L = 0xFC;           // 0xFFFF-0xEFB8 = 0x1047 = 4167, adjust for delay by 68 us
+            data2 = data1;			// Store previous data points
+            data1 = data0;
+            data0 = ReadADC();		// Read A/D and save the present sample in data0
+            dummy = ((int)data0 + data2) / 2;	// 60 Hz notch
+            output = (unsigned char)dummy;
+            PORTD = output;         // Output to D/A
+            if (enableBT) {
+                skipCount++;
+                if (skipCount == 2) {
+                    TransmitBT(functionBT);
+                    TransmitBT(data0);
+                    TransmitBT(output);
+                    skipCount = 0;
+                }
+            }
+            break;
+        case 8:						// Function 8: Median filter
+            TMR0H = 0xEF;           // Reload TMR0 for 4.167 ms count, Sampling rate = 240 Hz
+            TMR0L = 0xFF;           // 0xFFFF-0xEFB8 = 0x1047 = 4167, adjust for delay by 71 us
+            data0 = ReadADC();		// Read A/D and save the present sample in data0
+            for (i=8; i>0; i--) array[i] = array[i-1];	// Store the previous 8 points
+            array[0] = data0;			// Get new data point from A/D
+            for (i=0; i<9; i++) rank[i] = array[i];	// Make a copy of data array
+            for (i=0; i<5; i++) {		// Perform a bubble sort
+                for (j=i+1; j<9; j++) {
+                    if (rank[i] < rank[j]) {
+                        temp = rank[i];		// Swap
+                        rank[i] = rank[j];
+                        rank[j] = temp;
+                    }
+                }
+            }
+            output = rank[4];
+            PORTD = output;			// Median is at rank[4] of rank[0-8]
+            if (enableBT) {
+                skipCount++;
+                if (skipCount == 2) {
+                    TransmitBT(functionBT);
+                    TransmitBT(data0);
+                    TransmitBT(output);
+                    skipCount = 0;
+                }
+            }
+            break;
+        case 9:						// Function 9: Heart rate meter
+            TMR0H = 0xEC;			// Reload TMR0 for 5 ms count, sampling rate = 200 Hz
+            TMR0L = 0xC3;			// 0xFFFF-0xEC77 = 0x1388 = 5000, adjust for delay by 76 us
+            data1 = data0;			// Move old ECG sample to data1
+            data0 =  ReadADC();		// Store new ECG sample from ADC to data0
+            if (enableBT) {
+                skipCount++;
+                if (skipCount == 2) {
+                    TransmitBT(functionBT);
+                    TransmitBT(data0);
+                    TransmitBT(output);
+                    skipCount = 0;
+                }
+            }                         // MOBD = Multiplication of Backwards Differences
+            d2 = d1;					// Move oldest difference to d2
+            d1 = d0;					// Move older difference to d1
+            d0 = (int)data0 - data1;	// Store new difference in d0, (int) casting important
+            rri_count++;				// Increment RR-interval
+            mobd = 0;					// mobd = 0, unless sign consistency is met:
+            if (d0 > 0 && d1 > 0 && d2 > 0){	// (1) If 3 consecutive positive differences
+                mobd = d0 * d1;			// Multiply first two differences
+                mobd = mobd * d2;		// Multiply the oldest difference
+            }
+            if (d0 < 0 && d1 < 0 && d2 < 0){	// (2) If 3 consecutive negative differences
+                d0 = -d0;				// Take absolute value of differences
+                d1 = -d1;
+                d2 = -d2;
+                mobd = d0 * d1;			// Multiply first two differences
+                mobd = mobd * d2;		// Multiply the oldest difference
+            }
+            if (refractory){			// Avoid detecting extraneous peaks after QRS	
+                refractory++;
+                if (refractory == 40){	// Delay for 200 ms
+                    refractory = 0;		// Reset refractory flag to 0
+                    PORTBbits.RB3 = 0;	// Turn buzzer/LED off (Pin 36)
+                }
+            }
+            else if (mobd > threshold){	// If a peak is detected,
+                refractory = 1;			// Set refractory flag
+                PORTBbits.RB3 = 1;		// Turn buzzer/LED on (Pin 36)
+                display = 1;			// Set display flag										
+            }
+            if (mobd > 255) output = 255;
+            else output = (unsigned char)mobd;
+            PORTD = output;                // Output mobd value to Port D
+            break;
+        case 10:				// Function 10: Photoplethysmogram
+//          TMR0H = 0xFE;       // Reload TMR0 for 5 ms count, sampling rate = 200 Hz
+//          TMR0L = 0xA5;       // 0xFF5D for 1 KHz, adjust to 1.17 KHz
+            TMR0H = 0xFE;		// Reload TMR0 high-order byte
+            TMR0L = sampling_L;		// Reload TMR0 low-order byte
+            PORTCbits.RC3 = !PORTCbits.RC3;		// Toggle RC3 (pin 18) @ 1 KHz for PPG                
+            skipCount++;
+            if (skipCount == 5) {
+                SetupADC(2);				// Switch to A/D channel AN2
+                sampling_L = ReadADC();		// Read potentiometer setting from AN2
+                SetupADC(3);				// Switch to A/D channel AN2
+            }
+            output = ReadADC();         // Read PPG from AN3
+            d0 += output;               // Average over 8 points
+            if (skipCount == 8) {       // Display 1 of 8, 1 KHz / 8 = 125 Hz
+                skipCount = 0;
+                d0 = d0 >> 3;
+                output = (unsigned char) d0;
+                d0 = 0;
+                if (enableBT) {
+                    TransmitBT(functionBT);
+                    TransmitBT(output);
+                    TransmitBT(128);
+                }
+            }
+            break;
+        }
+        if (debounce0) debounce0--;	// switch debounce delay counter for INT0
+        if (debounce1) debounce1--;	// switch debounce delay counter for INT1
+        if (debounce2) debounce2--;	// switch debounce delay counter for INT2
+        PORTCbits.RC2 = !PORTCbits.RC2;		// Toggle RC2 (pin 17) for sampling frequency check
+        INTCONbits.TMR0IE = 1;		// Enable TMR0 interrupt
+    }
+    if (INTCONbits.INT0IF == 1) {	// INT0 (pin 33) negative edge - Function down
+        INTCONbits.INT0IE = 0;		// Disable interrupt
+        INTCONbits.INT0IF = 0;		// Reset interrupt flag
+        if (debounce0 == 0) {
+            if (function <= 0) function = 10;	// Set function range 0-10
+            else function--;
+            if (function == 9) SetupADC(1);		// ECG comes from AN1 channel
+            else SetupADC(0);					// Others come from AN0 channel
+            functionBT = function | 0xF0;       // function code for Android
+            update = 1;				// Signal main() to update LCD display
+            debounce0 = 10;			// Set switch debounce delay counter decremented by TMR0
+        }
+        INTCONbits.INT0IE = 1;		// Enable interrupt
+    }
+    if (INTCON3bits.INT1IF == 1) {	// INT1 (pin 34) negative edge - Function up
+        INTCON3bits.INT1IE = 0;		// Disable interrupt
+        INTCON3bits.INT1IF = 0;		// Reset interrupt flag
+        if (debounce1 == 0) {
+            if (function >= 10) function = 0;	// Set function range 0-10
+            else function++;
+            if (function == 9) SetupADC(1);		// ECG comes from AN1 channel
+            else SetupADC(0);					// Others come from AN0 channel
+            functionBT = function | 0xF0;       // function code for Android
+            update = 1;				// Signal main() to update LCD display
+            debounce1 = 10;			// Set switch debounce delay counter decremented by TMR0
+        }
+        INTCON3bits.INT1IE = 1;		// Enable interrupt
+    }
+    if (INTCON3bits.INT2IF == 1) {	// INT1 (pin 35) either edge - enableBT
+        INTCON3bits.INT2IE = 0;		// Disable interrupt
+        INTCON3bits.INT2IF = 0;		// Reset interrupt flag
+        if (debounce2 == 0) {
+            if (enableBT) {
+                enableBT = 0;       // Switching back to LCD display
+                SetupSerial();
+                INTCON2bits.INTEDG2 = 1;	// Set pin 35 (RB2/INT2) for positive edge 
+                Delay_ms(3000);		// Wait until the LCD display is ready
+                Backlight(1);       // turn LCD display backlight on
+                ClearScreen();      // Clear screen and set cursor to first position
+                PrintLine((const unsigned char*)"Function", 8);
+                update = 1;
+             }
+            else {                  // Switching back to Bluetooth
+                enableBT = 1;
+                SetupBluetooth();
+                INTCON2bits.INTEDG2 = 0;	// Set pin 35 (RB2/INT2) for negative edge 
+                update = 1;
+            }
+            debounce2 = 10;			// Set switch debounce delay counter decremented by TMR0
+        }
+        INTCON3bits.INT2IE = 1;		// Enable interrupt
+    }
+}
+
+void main(){   /****************************** Main program **********************************/
+    function = mode = LEDcount = skipCount = counter = debounce0 = debounce1 = 0; // Initialize
+    functionBT = function | 0xF0;
+    display = do_MOBD = rri_count = 0;
+    threshold = 128;			// Threshold for the MOBD QRS-detection algorithm
+    update = 1;					// Flag to signal LCD update
+    output = 50;				// Baseline for ECG simulation
+    sampling[0] = 16;	sampling[1] = 17;	sampling[2] = 18;	sampling[3] = 19;
+    sampling[4] = 20;	sampling[5] = 25;	sampling[6] = 30;	sampling[7] = 50;
+    sampling[8] = 70;	sampling[9] = 88;	sampling[10] = 108;	sampling[11] = 126;
+    sampling[12] = 145;	sampling[13] = 173;	sampling[14] = 192;	sampling[15] = 228;
+    TMRcntH[0] = 11;	TMRcntH[1] = 26;	TMRcntH[2] = 39;	TMRcntH[3] = 50;
+    TMRcntH[4] = 60;	TMRcntH[5] = 99;	TMRcntH[6] = 125;	TMRcntH[7] = 177;
+    TMRcntH[8] = 200;	TMRcntH[9] = 211;	TMRcntH[10] = 219;	TMRcntH[11] = 225;
+    TMRcntH[12] = 229;	TMRcntH[13] = 233;	TMRcntH[14] = 235;	TMRcntH[15] = 238;
+    TMRcntL[0] = 229;	TMRcntL[1] = 66;	TMRcntL[2] = 6;     TMRcntL[3] = 114;
+    TMRcntL[4] = 185;	TMRcntL[5] = 201;	TMRcntL[6] = 212;	TMRcntL[7] = 233;
+    TMRcntL[8] = 60;	TMRcntL[9] = 166;	TMRcntL[10] = 222;	TMRcntL[11] = 9;
+    TMRcntL[12] = 25;	TMRcntL[13] = 117;	TMRcntL[14] = 177;	TMRcntL[15] = 232;
+    sampling_H = 0xF0;		// initialize for 4.167 ms count, Sampling rate = 240 Hz
+    sampling_L = 0x7C;		// 0xFFFF-0xEFB8 = 0x1047 = 4167, adjust for delay by 68 us
+    TRISA = 0b11111111;     // Set all of Port A as input
+    ADCON2 = 0b00001001;    // bit 5-3: acq time = 2 TAD;  bit 2-0: clock Fosc/8
+    ADCON1	= 0b00001010;   // bit 5: Vref - VSS; bit 4: Vref + VDD; bit 3-0: Set A0-A4
+    TRISB = 0b00000111;			// RB0-2 as inputs, others outputs, RB3 drives buzzer
+    TRISC = 0b11110011;			// RC2 as output, 1 KHz to drive LED of PPG
+    TRISD = 0b00000000;			// Set all port D pins as outputs
+    PORTD = 0;					// Set port D to 0's
+    PORTCbits.RC3 = 0;          // Turn off PPG LED
+    SetupADC(0);				// Call SetupADC() to set up channel 0, AN0 (pin 2)
+    enableBT = PORTBbits.RB2;   // Check for BLUETOOTH enabled
+    SetupSerial();				// Set up USART Asynchronous Transmit for LCD display
+    Delay_ms(100);	
+    Transmit(18);               // Ctl R to reset BAUD rate to 9600
+    Delay_ms(2500);				// Wait until the LCD display is ready
+    if (enableBT == 0) {
+        Backlight(1);           // turn LCD display backlight on
+        ClearScreen();			// Clear screen and set cursor to first position
+        PrintLine((const unsigned char*)"  BME 361 Demo", 14);
+        SetPosition(64);		// Go to beginning of Line 2;
+        PrintLine((const unsigned char*)" Biomeasurement ",16);	// Put your trademark here
+        Delay_ms(3000);
+        ClearScreen();			// Clear screen and set cursor to first position
+        PrintLine((const unsigned char*)"Function", 8);
+    }
+    T0CON = 0b10001000;			// Turn on TMR0 and use the prescaler 000 (1:2))
+    INTCON = 0b10110000;		// GIE(7) = TMR0IE = INT0IE = 1
+    INTCONbits.TMR0IF = PIR1bits.TMR1IF = 0;
+    INTCONbits.TMR0IE = 1;		// Enable TMR0 interrupt
+    INTCON2bits.INTEDG0 = 0;	// Set pin 33 (RB0/INT0) for negative edge trigger
+    INTCON2bits.INTEDG1 = 0;	// Set pin 34 (RB1/INT1) for negative edge trigger
+    if (enableBT) INTCON2bits.INTEDG2 = 0;	// Set pin 35 (RB2/INT2) for negative edge 
+    else INTCON2bits.INTEDG2 = 1;	// Set pin 35 (RB2/INT2) for positive edge 
+    INTCONbits.INT0IF = INTCON3bits.INT1IF = INTCON3bits.INT2IF = 0;// Reset interrupt flags
+    INTCONbits.INT0IE = 1;		// Enable INT0 interrupt (function down)
+    INTCON3bits.INT1IE = 1;		// Enable INT1 interrupt (function up)
+    INTCON3bits.INT2IE = 1;		// Enable INT2 interrupt (enableBT)
+    function = 0;
+    while (1) {
+        if (enableBT && PIR1bits.RCIF) {            // Wait until USART got data
+            temp = RCREG;                           // Read received data
+            PIR1bits.RCIF = 0;                      // Reset RC flag
+            if (temp == 1) {                        // 1 for increment
+                if (function >= 10) function = 0;	// Set function range 0-10
+                else function++;
+            }
+            if (temp == 2) {                        // 2 for decrement
+                if (function == 0) function = 10;	// Set function range 0-10
+                else function--;
+            }
+            if (function == 9) SetupADC(1);         // ECG comes from AN1 channel
+            else SetupADC(0);                       // Others come from AN0 channel
+            functionBT = function | 0xF0;           // function code for Android
+            update = 1;                             // Signal main() to update LCD display
+        }
+        if (update) {                   // The update flag is set by INT0 or INT1
+            INTCONbits.TMR0IE = 0;		// Disable TMR0 interrupt
+            update = 0;                 // Reset update flag
+            if (!enableBT) {
+                PrintNum(function, 8);	// Update the function number on LCD display
+                SetPosition(64);        // Go to beginning of Line 2;
+                switch (function) {
+                    case 0:  PrintLine((const unsigned char*)"Binary counter  ",16); break;
+                    case 1:  PrintLine((const unsigned char*)"ECG simulation  ",16); break;
+                    case 2:  PrintLine((const unsigned char*)"Echo (A/D - D/A)",16); break;
+                    case 3:  PrintLine((const unsigned char*)"Echo @ fs     Hz",16); break;
+                    case 4:  PrintLine((const unsigned char*)"Derivative      ",16); break;
+                    case 5:  PrintLine((const unsigned char*)"Low-pass filter ",16); break;
+                    case 6:  PrintLine((const unsigned char*)"Hi-freq enhance ",16); break;
+                    case 7:  PrintLine((const unsigned char*)"60Hz notch filtr",16); break;
+                    case 8:  PrintLine((const unsigned char*)"Median filter   ",16); break;
+                    case 9:  PrintLine((const unsigned char*)"HR =       bpm  ",16); break;
+                    case 10: PrintLine((const unsigned char*)"PhotoplethysomoG",16); break;
+                }
+                enableBT = PORTBbits.RB2;   // Check again for BLUETOOTH enabled
+            }
+            if (function) {
+                LEDcount = function << 4;   // display "function" at the LEDs
+                PORTB = LEDcount;
+            }
+            INTCONbits.TMR0IE = 1;          // Ensable TMR0 interrupt
+        }
+        switch (function) {
+        case 0:             // Function 0: Binary counter
+            LEDcount++;						// Upcounter
+            PORTB = LEDcount & 0b11110000;	// Mask out the lower 4 bits
+            PORTD = LEDcount;				// Output ramp to verify linearity of the D/A
+            Delay_ms(20);					// Delay to slow down the counting
+            if (enableBT) {
+                skipCount++;
+                if (skipCount == 2) {
+                    TransmitBT(functionBT);
+                    TransmitBT(LEDcount);
+                    TransmitBT(128);
+                    skipCount = 0;
+                }
+            }
+            break;
+        case 3:				// Function 3: Echo (vary rate)
+            INTCONbits.TMR0IE = 0;			// Disable TMR0 interrupt
+            if (counter1 != counter && !enableBT) {
+                temp = sampling[counter];
+                PrintNum(temp,74);
+                counter1 = counter;
+            }
+            INTCONbits.TMR0IE = 1;			// Enable TMR0 interrupt
+            break;
+        case 9:				// Function 9: Multiplication of Backward Differences (MOBD)
+            if (display && !enableBT){		// Display Heart Rate in 3 digits
+                hr = 12000/rri_count;		// 60/0.005 = 12000
+                rri_count = 0;				// Reset RRI counter
+                PrintNum(hr, 71);			// Isolates each digit and displays
+                display = 0;				// Reset display flag
+            }
+            break;
+        }
+    }
+}
